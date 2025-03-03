@@ -1,0 +1,463 @@
+"""
+Salesforce Data Cloud Integrator
+
+An open-source connector for integrating Salesforce Data Cloud with third-party analytics platforms.
+Enables seamless data flow between Salesforce Data Cloud and various analytics tools,
+improving data visualization and insights capabilities.
+
+Author: [Your Name]
+License: MIT
+"""
+
+import json
+import logging
+import os
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Union, Any
+
+import pandas as pd
+import requests
+from salesforce_bulk import SalesforceBulk
+from simple_salesforce import Salesforce
+from tableauserverclient as TSC
+
+
+class SalesforceDataCloudConnector:
+    """
+    Core connector class for Salesforce Data Cloud integration with third-party analytics platforms.
+    Handles authentication, data extraction, transformation, and loading into target platforms.
+    """
+    
+    def __init__(self, config_path: str = None, config: Dict = None):
+        """
+        Initialize the Salesforce Data Cloud Connector with either a config file path or dict.
+        
+        Args:
+            config_path: Path to JSON configuration file
+            config: Configuration dictionary with connection parameters
+        """
+        self.logger = self._setup_logging()
+        
+        if config:
+            self.config = config
+        elif config_path:
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+        else:
+            raise ValueError("Must provide either config_path or config dictionary")
+            
+        self.sf_client = None
+        self.bulk_client = None
+        self.tableau_client = None
+        self.logger.info("Salesforce Data Cloud Connector initialized")
+    
+    def _setup_logging(self) -> logging.Logger:
+        """Configure logging for the connector"""
+        logger = logging.getLogger("sf_data_cloud_connector")
+        logger.setLevel(logging.INFO)
+        
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            
+        return logger
+    
+    def connect_to_salesforce(self) -> None:
+        """Establish connection to Salesforce using the credentials in config"""
+        try:
+            self.sf_client = Salesforce(
+                username=self.config['salesforce']['username'],
+                password=self.config['salesforce']['password'],
+                security_token=self.config['salesforce']['security_token'],
+                domain=self.config['salesforce'].get('domain', 'login')
+            )
+            
+            self.bulk_client = SalesforceBulk(
+                username=self.config['salesforce']['username'],
+                password=self.config['salesforce']['password'],
+                security_token=self.config['salesforce']['security_token'],
+                domain=self.config['salesforce'].get('domain', 'login')
+            )
+            
+            self.logger.info("Successfully connected to Salesforce")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Salesforce: {str(e)}")
+            raise ConnectionError(f"Salesforce connection failed: {str(e)}")
+    
+    def connect_to_tableau(self) -> None:
+        """Establish connection to Tableau Server"""
+        try:
+            tableau_auth = TSC.PersonalAccessTokenAuth(
+                self.config['tableau']['token_name'],
+                self.config['tableau']['token_value'],
+                self.config['tableau']['site_id']
+            )
+            
+            self.tableau_client = TSC.Server(self.config['tableau']['server_url'])
+            self.tableau_client.auth.sign_in(tableau_auth)
+            self.logger.info("Successfully connected to Tableau Server")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Tableau: {str(e)}")
+            raise ConnectionError(f"Tableau connection failed: {str(e)}")
+    
+    def query_data_cloud(self, query: str) -> pd.DataFrame:
+        """
+        Execute a query against Salesforce Data Cloud and return results as DataFrame
+        
+        Args:
+            query: SOQL query to execute against Data Cloud
+            
+        Returns:
+            DataFrame containing query results
+        """
+        if not self.sf_client:
+            self.connect_to_salesforce()
+            
+        try:
+            # Execute query against Salesforce Data Cloud
+            result = self.sf_client.query_all(query)
+            records = result['records']
+            
+            # Convert to DataFrame and clean up
+            df = pd.DataFrame(records)
+            if not df.empty and 'attributes' in df.columns:
+                df = df.drop('attributes', axis=1)
+                
+            self.logger.info(f"Query returned {len(df)} records")
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error querying Data Cloud: {str(e)}")
+            raise RuntimeError(f"Data Cloud query failed: {str(e)}")
+    
+    def export_to_csv(self, data: pd.DataFrame, filepath: str) -> str:
+        """
+        Export DataFrame to CSV file
+        
+        Args:
+            data: DataFrame to export
+            filepath: Path to save the CSV file
+            
+        Returns:
+            Path to the saved file
+        """
+        try:
+            data.to_csv(filepath, index=False)
+            self.logger.info(f"Data exported to {filepath}")
+            return filepath
+        except Exception as e:
+            self.logger.error(f"Failed to export data to CSV: {str(e)}")
+            raise IOError(f"CSV export failed: {str(e)}")
+    
+    def upload_to_tableau(self, data_source_name: str, filepath: str) -> str:
+        """
+        Upload a data source to Tableau Server
+        
+        Args:
+            data_source_name: Name for the Tableau data source
+            filepath: Path to the file to upload
+            
+        Returns:
+            ID of the created Tableau data source
+        """
+        if not self.tableau_client:
+            self.connect_to_tableau()
+            
+        try:
+            # Create new data source
+            new_datasource = TSC.DatasourceItem(self.config['tableau']['project_id'])
+            new_datasource.name = data_source_name
+            
+            # Upload to server
+            with open(filepath, 'rb') as f:
+                resp = self.tableau_client.datasources.publish(
+                    new_datasource, 
+                    f, 
+                    'Overwrite'
+                )
+            
+            self.logger.info(f"Data source published to Tableau - ID: {resp.id}")
+            return resp.id
+            
+        except Exception as e:
+            self.logger.error(f"Failed to upload to Tableau: {str(e)}")
+            raise RuntimeError(f"Tableau upload failed: {str(e)}")
+    
+    def create_data_pipeline(self, query: str, data_source_name: str, 
+                             target: str = 'tableau') -> Dict[str, Any]:
+        """
+        Create a complete data pipeline from Salesforce Data Cloud to a target platform
+        
+        Args:
+            query: SOQL query to execute against Data Cloud
+            data_source_name: Name for the target data source
+            target: Target platform ('tableau', 'csv', etc.)
+            
+        Returns:
+            Dictionary with pipeline results
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_file = f"temp_data_{timestamp}.csv"
+        
+        try:
+            # Extract data from Salesforce Data Cloud
+            self.logger.info("Extracting data from Salesforce Data Cloud")
+            df = self.query_data_cloud(query)
+            
+            # Export to temporary CSV
+            csv_path = self.export_to_csv(df, temp_file)
+            
+            result = {
+                "timestamp": timestamp,
+                "record_count": len(df),
+                "source": "salesforce_data_cloud",
+                "query": query
+            }
+            
+            # Upload to target platform
+            if target.lower() == 'tableau':
+                result["target"] = "tableau"
+                result["datasource_id"] = self.upload_to_tableau(data_source_name, csv_path)
+            elif target.lower() == 'csv':
+                result["target"] = "csv"
+                result["file_path"] = csv_path
+            else:
+                raise ValueError(f"Unsupported target platform: {target}")
+                
+            self.logger.info(f"Data pipeline completed successfully: {result}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Data pipeline failed: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary file
+            if target.lower() != 'csv' and os.path.exists(temp_file):
+                os.remove(temp_file)
+                self.logger.info(f"Temporary file {temp_file} removed")
+
+
+class ApexHandler:
+    """
+    Handler for Apex code execution and integration with Salesforce platform
+    """
+    
+    def __init__(self, sf_connector: SalesforceDataCloudConnector):
+        """
+        Initialize with a SalesforceDataCloudConnector instance
+        
+        Args:
+            sf_connector: An initialized SalesforceDataCloudConnector
+        """
+        self.sf_connector = sf_connector
+        self.logger = sf_connector.logger
+    
+    def deploy_apex_class(self, class_path: str) -> Dict:
+        """
+        Deploy an Apex class to the connected Salesforce org
+        
+        Args:
+            class_path: Path to the Apex class file
+            
+        Returns:
+            Deployment result information
+        """
+        if not self.sf_connector.sf_client:
+            self.sf_connector.connect_to_salesforce()
+            
+        try:
+            with open(class_path, 'r') as f:
+                apex_content = f.read()
+                
+            # Using Tooling API to deploy Apex class
+            tooling = self.sf_connector.sf_client.tooling
+            payload = {
+                'MetadataContainerId': self._create_metadata_container(),
+                'ContentEntityId': self._get_apex_class_id(class_path),
+                'Body': apex_content
+            }
+            
+            if not payload['ContentEntityId']:
+                # If class doesn't exist, create new one
+                result = self._create_new_apex_class(os.path.basename(class_path), apex_content)
+            else:
+                # Update existing class
+                result = tooling.ApexClassMember.create(payload)
+                
+            self.logger.info(f"Apex class deployed: {result}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to deploy Apex class: {str(e)}")
+            raise RuntimeError(f"Apex deployment failed: {str(e)}")
+    
+    def _create_metadata_container(self) -> str:
+        """Create a metadata container for Apex deployment"""
+        tooling = self.sf_connector.sf_client.tooling
+        result = tooling.MetadataContainer.create({'Name': f'DataCloudContainer_{int(time.time())}'})
+        return result['id']
+    
+    def _get_apex_class_id(self, class_path: str) -> Optional[str]:
+        """Get the ID of an existing Apex class"""
+        class_name = os.path.basename(class_path).replace('.cls', '')
+        tooling = self.sf_connector.sf_client.tooling
+        query = f"SELECT Id FROM ApexClass WHERE Name = '{class_name}'"
+        
+        try:
+            result = tooling.query(query)
+            if result['records']:
+                return result['records'][0]['Id']
+            return None
+        except Exception:
+            return None
+    
+    def _create_new_apex_class(self, class_name: str, body: str) -> Dict:
+        """Create a new Apex class"""
+        tooling = self.sf_connector.sf_client.tooling
+        payload = {
+            'Name': class_name.replace('.cls', ''),
+            'Body': body
+        }
+        result = tooling.ApexClass.create(payload)
+        return result
+    
+    def execute_anonymous_apex(self, apex_code: str) -> Dict:
+        """
+        Execute anonymous Apex code
+        
+        Args:
+            apex_code: Apex code to execute
+            
+        Returns:
+            Execution result
+        """
+        if not self.sf_connector.sf_client:
+            self.sf_connector.connect_to_salesforce()
+            
+        try:
+            tooling = self.sf_connector.sf_client.tooling
+            result = tooling.executeAnonymous(apex_code)
+            
+            if result['compiled'] and result['success']:
+                self.logger.info("Anonymous Apex executed successfully")
+            else:
+                self.logger.error(f"Apex execution failed: {result.get('compileProblem', '')} {result.get('exceptionMessage', '')}")
+                
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to execute anonymous Apex: {str(e)}")
+            raise RuntimeError(f"Apex execution failed: {str(e)}")
+
+
+class DataCloudETLJob:
+    """
+    ETL job manager for Salesforce Data Cloud integration
+    Handles scheduled extraction, transformation, and loading processes
+    """
+    
+    def __init__(self, connector: SalesforceDataCloudConnector, job_config: Dict):
+        """
+        Initialize ETL job with connector and configuration
+        
+        Args:
+            connector: Initialized SalesforceDataCloudConnector
+            job_config: Job configuration with schedule, queries, and targets
+        """
+        self.connector = connector
+        self.job_config = job_config
+        self.logger = connector.logger
+    
+    def run(self) -> Dict:
+        """
+        Run the ETL job based on configuration
+        
+        Returns:
+            Job results
+        """
+        self.logger.info(f"Starting ETL job: {self.job_config.get('name', 'Unnamed job')}")
+        results = {}
+        
+        try:
+            # Process each query in the configuration
+            for query_config in self.job_config.get('queries', []):
+                query_name = query_config.get('name', 'unnamed_query')
+                query = query_config.get('soql')
+                target = query_config.get('target', {})
+                
+                if not query:
+                    self.logger.warning(f"Skipping {query_name} - No SOQL query provided")
+                    continue
+                    
+                # Apply transformations if specified
+                transformations = query_config.get('transformations', [])
+                
+                # Execute the query and create pipeline
+                result = self.connector.create_data_pipeline(
+                    query=query,
+                    data_source_name=f"{self.job_config.get('name', 'Data Cloud Export')} - {query_name}",
+                    target=target.get('type', 'tableau')
+                )
+                
+                results[query_name] = result
+                
+            self.logger.info(f"ETL job completed: {len(results)} queries processed")
+            return {
+                "job_name": self.job_config.get('name', 'Unnamed job'),
+                "timestamp": datetime.now().isoformat(),
+                "results": results
+            }
+            
+        except Exception as e:
+            self.logger.error(f"ETL job failed: {str(e)}")
+            raise
+
+
+def main():
+    """Main entry point for the Salesforce Data Cloud Integrator"""
+    # Example usage
+    config = {
+        "salesforce": {
+            "username": "YOUR_USERNAME",
+            "password": "YOUR_PASSWORD",
+            "security_token": "YOUR_SECURITY_TOKEN"
+        },
+        "tableau": {
+            "server_url": "https://your-tableau-server",
+            "token_name": "YOUR_TOKEN_NAME",
+            "token_value": "YOUR_TOKEN_VALUE",
+            "site_id": "YOUR_SITE_ID",
+            "project_id": "YOUR_PROJECT_ID"
+        }
+    }
+    
+    connector = SalesforceDataCloudConnector(config=config)
+    
+    try:
+        # Example query and pipeline creation
+        query = """
+        SELECT Account.Name, Account.Industry, SUM(Amount) as TotalAmount
+        FROM Opportunity
+        WHERE CloseDate = THIS_YEAR
+        GROUP BY Account.Name, Account.Industry
+        """
+        
+        result = connector.create_data_pipeline(
+            query=query,
+            data_source_name="Annual Opportunity by Account",
+            target="tableau"
+        )
+        
+        print(json.dumps(result, indent=2))
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
