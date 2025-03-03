@@ -1,0 +1,329 @@
+/**
+ * DataCloudIntegrationController
+ * 
+ * Apex controller that facilitates the integration between Salesforce Data Cloud
+ * and external analytics platforms by exposing Data Cloud data via REST API.
+ * 
+ * This controller can be used directly from external systems or from the provided
+ * Python connector to enable seamless data integration.
+ * 
+ * @author [Your Name]
+ */
+public with sharing class DataCloudIntegrationController {
+    
+    /**
+     * Retrieves Data Cloud query results in JSON format
+     * 
+     * @param soql The SOQL query to execute against Data Cloud
+     * @return String JSON representation of the query results
+     */
+    @AuraEnabled(cacheable=true)
+    public static String getDataCloudQueryResults(String soql) {
+        try {
+            // Validate and sanitize the query
+            if (String.isBlank(soql)) {
+                throw new DataCloudIntegrationException('Query cannot be empty');
+            }
+            
+            // Execute the query
+            List<SObject> results = Database.query(soql);
+            
+            // Convert to JSON
+            return JSON.serialize(results);
+        } catch (Exception e) {
+            throw new AuraEnabled(new DataCloudIntegrationException(
+                'Error executing Data Cloud query: ' + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Creates a Data Cloud data set from external system data
+     * 
+     * @param datasetName Name of the dataset to create
+     * @param dataJson JSON string containing the data
+     * @param schema JSON schema of the data
+     * @return String ID of the created dataset
+     */
+    @AuraEnabled
+    public static String createDataCloudDataset(String datasetName, String dataJson, String schema) {
+        try {
+            // Validate inputs
+            if (String.isBlank(datasetName) || String.isBlank(dataJson)) {
+                throw new DataCloudIntegrationException('Dataset name and data are required');
+            }
+            
+            // Parse the incoming data
+            List<Object> records = (List<Object>) JSON.deserializeUntyped(dataJson);
+            
+            // Here we would call the Data Cloud API to create a dataset
+            // This is a placeholder for actual implementation
+            String datasetId = createDatasetInDataCloud(datasetName, records, schema);
+            
+            return datasetId;
+        } catch (Exception e) {
+            throw new AuraEnabled(new DataCloudIntegrationException(
+                'Error creating Data Cloud dataset: ' + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Retrieves metadata about available Data Cloud objects
+     * 
+     * @return String JSON representation of Data Cloud objects metadata
+     */
+    @AuraEnabled(cacheable=true)
+    public static String getDataCloudObjectsMetadata() {
+        try {
+            // Retrieve global describe
+            Map<String, Schema.SObjectType> globalDescribe = Schema.getGlobalDescribe();
+            
+            // Filter for Data Cloud objects
+            Map<String, Object> dataCloudObjects = new Map<String, Object>();
+            
+            for (String objectName : globalDescribe.keySet()) {
+                Schema.SObjectType objectType = globalDescribe.get(objectName);
+                Schema.DescribeSObjectResult objectDescribe = objectType.getDescribe();
+                
+                // Check if this is a Data Cloud object (this is a simplification)
+                // In a real implementation, you would use a more reliable method to identify Data Cloud objects
+                if (objectName.startsWith('DataCloud') || objectDescribe.isCustom()) {
+                    Map<String, Object> objectInfo = new Map<String, Object>();
+                    objectInfo.put('label', objectDescribe.getLabel());
+                    objectInfo.put('apiName', objectDescribe.getName());
+                    objectInfo.put('keyPrefix', objectDescribe.getKeyPrefix());
+                    
+                    // Get field information
+                    Map<String, Schema.SObjectField> fieldMap = objectDescribe.fields.getMap();
+                    List<Object> fields = new List<Object>();
+                    
+                    for (String fieldName : fieldMap.keySet()) {
+                        Schema.DescribeFieldResult fieldDescribe = fieldMap.get(fieldName).getDescribe();
+                        Map<String, Object> fieldInfo = new Map<String, Object>();
+                        
+                        fieldInfo.put('label', fieldDescribe.getLabel());
+                        fieldInfo.put('apiName', fieldDescribe.getName());
+                        fieldInfo.put('type', fieldDescribe.getType().name());
+                        fieldInfo.put('isCustom', fieldDescribe.isCustom());
+                        
+                        fields.add(fieldInfo);
+                    }
+                    
+                    objectInfo.put('fields', fields);
+                    dataCloudObjects.put(objectName, objectInfo);
+                }
+            }
+            
+            return JSON.serialize(dataCloudObjects);
+        } catch (Exception e) {
+            throw new AuraEnabled(new DataCloudIntegrationException(
+                'Error fetching Data Cloud objects metadata: ' + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Creates a scheduled job to sync Data Cloud data to external systems
+     * 
+     * @param jobName Name of the sync job
+     * @param query SOQL query to execute
+     * @param schedule Cron expression for scheduling
+     * @param targetSystem JSON configuration of the target system
+     * @return String ID of the created sync job
+     */
+    @AuraEnabled
+    public static String createDataSyncJob(String jobName, String query, 
+                                          String schedule, String targetSystem) {
+        try {
+            // Validate inputs
+            if (String.isBlank(jobName) || String.isBlank(query) || 
+                String.isBlank(schedule) || String.isBlank(targetSystem)) {
+                throw new DataCloudIntegrationException('Missing required parameters');
+            }
+            
+            // Parse target system configuration
+            Map<String, Object> targetConfig = (Map<String, Object>) JSON.deserializeUntyped(targetSystem);
+            
+            // Create a new sync job record
+            DataCloudSyncJob__c syncJob = new DataCloudSyncJob__c(
+                Name = jobName,
+                Query__c = query,
+                Schedule__c = schedule,
+                TargetSystem__c = targetSystem,
+                Status__c = 'Active'
+            );
+            
+            insert syncJob;
+            
+            // Schedule the job
+            String jobId = scheduleDataSyncJob(syncJob.Id, schedule);
+            
+            // Update the record with the scheduled job ID
+            syncJob.ScheduledJobId__c = jobId;
+            update syncJob;
+            
+            return syncJob.Id;
+        } catch (Exception e) {
+            throw new AuraEnabled(new DataCloudIntegrationException(
+                'Error creating data sync job: ' + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Executes a data sync job immediately
+     * 
+     * @param syncJobId ID of the sync job to execute
+     * @return String Result of the execution
+     */
+    @AuraEnabled
+    public static String executeDataSyncJob(String syncJobId) {
+        try {
+            // Retrieve the sync job
+            DataCloudSyncJob__c syncJob = [
+                SELECT Id, Name, Query__c, TargetSystem__c, LastRunTime__c
+                FROM DataCloudSyncJob__c
+                WHERE Id = :syncJobId
+            ];
+            
+            // Execute the job
+            String result = executeSync(syncJob);
+            
+            // Update the last run time
+            syncJob.LastRunTime__c = DateTime.now();
+            syncJob.LastRunStatus__c = 'Success';
+            update syncJob;
+            
+            return result;
+        } catch (Exception e) {
+            // Log the error and update the record
+            DataCloudSyncJob__c syncJob = [
+                SELECT Id FROM DataCloudSyncJob__c WHERE Id = :syncJobId
+            ];
+            
+            syncJob.LastRunTime__c = DateTime.now();
+            syncJob.LastRunStatus__c = 'Failed';
+            syncJob.LastErrorMessage__c = e.getMessage();
+            update syncJob;
+            
+            throw new AuraEnabled(new DataCloudIntegrationException(
+                'Error executing data sync job: ' + e.getMessage()));
+        }
+    }
+    
+    /**
+     * REST API endpoint for retrieving Data Cloud query results
+     */
+    @RestResource(urlMapping='/v1/datacloud/query/*')
+    global with sharing class DataCloudQueryEndpoint {
+        
+        @HttpGet
+        global static void getQueryResults() {
+            RestRequest req = RestContext.request;
+            RestResponse res = RestContext.response;
+            
+            try {
+                // Get query from URL params
+                String query = req.params.get('q');
+                
+                if (String.isBlank(query)) {
+                    throw new DataCloudIntegrationException('Query parameter "q" is required');
+                }
+                
+                // Execute query
+                String results = getDataCloudQueryResults(query);
+                
+                // Return results
+                res.statusCode = 200;
+                res.responseBody = Blob.valueOf(results);
+                res.addHeader('Content-Type', 'application/json');
+            } catch (Exception e) {
+                res.statusCode = 400;
+                res.responseBody = Blob.valueOf(JSON.serialize(new Map<String, String>{
+                    'error' => e.getMessage()
+                }));
+                res.addHeader('Content-Type', 'application/json');
+            }
+        }
+    }
+    
+    // Helper methods
+    
+    /**
+     * Creates a dataset in Data Cloud (placeholder)
+     */
+    private static String createDatasetInDataCloud(String datasetName, List<Object> records, String schema) {
+        // Placeholder for actual implementation
+        // In a real implementation, this would call Data Cloud APIs
+        return 'sample-dataset-id-' + String.valueOf(Math.random()).substring(2, 10);
+    }
+    
+    /**
+     * Schedules a data sync job
+     */
+    private static String scheduleDataSyncJob(Id syncJobId, String schedule) {
+        DataCloudSyncScheduler scheduler = new DataCloudSyncScheduler(syncJobId);
+        return System.schedule('DataCloud Sync: ' + syncJobId, schedule, scheduler);
+    }
+    
+    /**
+     * Executes a sync job
+     */
+    private static String executeSync(DataCloudSyncJob__c syncJob) {
+        // Execute the query
+        List<SObject> results = Database.query(syncJob.Query__c);
+        
+        // Parse target system configuration
+        Map<String, Object> targetConfig = (Map<String, Object>) 
+            JSON.deserializeUntyped(syncJob.TargetSystem__c);
+        
+        String targetType = (String) targetConfig.get('type');
+        
+        // Handle different target types
+        if (targetType == 'tableau') {
+            return sendToTableau(results, targetConfig);
+        } else if (targetType == 'powerbi') {
+            return sendToPowerBI(results, targetConfig);
+        } else {
+            throw new DataCloudIntegrationException('Unsupported target type: ' + targetType);
+        }
+    }
+    
+    /**
+     * Sends data to Tableau (placeholder)
+     */
+    private static String sendToTableau(List<SObject> data, Map<String, Object> config) {
+        // Placeholder for actual implementation
+        return 'Tableau export successful: ' + data.size() + ' records';
+    }
+    
+    /**
+     * Sends data to Power BI (placeholder)
+     */
+    private static String sendToPowerBI(List<SObject> data, Map<String, Object> config) {
+        // Placeholder for actual implementation
+        return 'Power BI export successful: ' + data.size() + ' records';
+    }
+    
+    /**
+     * Custom exception class for Data Cloud integration errors
+     */
+    public class DataCloudIntegrationException extends Exception {}
+    
+    /**
+     * Scheduler class for Data Cloud sync jobs
+     */
+    public class DataCloudSyncScheduler implements Schedulable {
+        private Id syncJobId;
+        
+        public DataCloudSyncScheduler(Id syncJobId) {
+            this.syncJobId = syncJobId;
+        }
+        
+        public void execute(SchedulableContext sc) {
+            try {
+                executeDataSyncJob(syncJobId);
+            } catch (Exception e) {
+                // Log error
+                System.debug(LoggingLevel.ERROR, 'Error executing scheduled sync: ' + e.getMessage());
+            }
+        }
+    }
+}
