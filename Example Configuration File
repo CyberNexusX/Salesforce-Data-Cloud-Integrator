@@ -1,0 +1,58 @@
+{
+  "salesforce": {
+    "username": "your-username@example.com",
+    "password": "your-password",
+    "security_token": "your-security-token",
+    "domain": "login"
+  },
+  "tableau": {
+    "server_url": "https://your-tableau-server",
+    "token_name": "your-token-name",
+    "token_value": "your-token-value",
+    "site_id": "your-site-id",
+    "project_id": "your-project-id"
+  },
+  "powerbi": {
+    "workspace_id": "your-workspace-id",
+    "dataset_id": "your-dataset-id",
+    "client_id": "your-azure-client-id",
+    "client_secret": "your-azure-client-secret",
+    "tenant_id": "your-azure-tenant-id"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "data_cloud_integrator.log",
+    "max_size_mb": 10,
+    "backup_count": 5
+  },
+  "etl_jobs": [
+    {
+      "name": "Daily Account Sync",
+      "schedule": "0 0 * * *",
+      "queries": [
+        {
+          "name": "active_accounts",
+          "soql": "SELECT Id, Name, Industry, AnnualRevenue FROM Account WHERE IsActive = true",
+          "target": {
+            "type": "tableau",
+            "datasource_name": "Active Accounts"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Weekly Sales Report",
+      "schedule": "0 0 * * 0",
+      "queries": [
+        {
+          "name": "closed_opportunities",
+          "soql": "SELECT Owner.Name, SUM(Amount) as TotalAmount FROM Opportunity WHERE IsClosed = true AND CloseDate = LAST_N_DAYS:7 GROUP BY Owner.Name",
+          "target": {
+            "type": "powerbi",
+            "datasource_name": "Weekly Sales"
+          }
+        }
+      ]
+    }
+  ]
+}
